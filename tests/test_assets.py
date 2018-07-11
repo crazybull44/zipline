@@ -21,6 +21,7 @@ from datetime import timedelta
 from functools import partial
 import os
 import pickle
+import string
 import sys
 from types import GetSetDescriptorType
 from unittest import TestCase
@@ -975,7 +976,7 @@ class AssetFinderTestCase(WithTradingCalendars, ZiplineTestCase):
             ignore_index=True,
         )
         # make every symbol unique
-        equities['symbol'] = [chr(ord('A') + i) for i in range(len(equities))]
+        equities['symbol'] = list(string.ascii_uppercase[:len(equities)])
 
         # shuffle up the sids so they are not contiguous per exchange
         sids = np.arange(len(equities))
@@ -989,7 +990,7 @@ class AssetFinderTestCase(WithTradingCalendars, ZiplineTestCase):
             {'exchange': 'CA_EXCHANGE', 'country_code': 'CA'},
             {'exchange': 'JP_EXCHANGE', 'country_code': 'JP'},
         ])
-        sids_per_country = {
+        sids_by_country = {
             'US': equities.index[:2 * assets_per_exchange],
             'CA': equities.index[
                 2 * assets_per_exchange:3 * assets_per_exchange
@@ -1031,7 +1032,7 @@ class AssetFinderTestCase(WithTradingCalendars, ZiplineTestCase):
 
             for country_codes in powerset(exchanges.country_code.unique()):
                 expected_sids = pd.Int64Index(sorted(concat(
-                    sids_per_country[country_code]
+                    sids_by_country[country_code]
                     for country_code in country_codes
                 )))
                 permuted_sids = [
@@ -1451,8 +1452,6 @@ class AssetFinderTestCase(WithTradingCalendars, ZiplineTestCase):
 
 
 class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
-    asset_finder_type = AssetFinder
-
     def write_assets(self, **kwargs):
         self._asset_writer.write(**kwargs)
 
@@ -1461,7 +1460,7 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
 
         conn = self.enter_instance_context(empty_assets_db())
         self._asset_writer = AssetDBWriter(conn)
-        self.asset_finder = self.asset_finder_type(conn)
+        self.asset_finder = AssetFinder(conn)
 
     @staticmethod
     def country_code(n):
@@ -1470,17 +1469,18 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
     def test_lookup_symbol_delimited(self):
         as_of = pd.Timestamp('2013-01-01', tz='UTC')
         num_assets = 3
+        sids = list(range(num_assets))
         frame = pd.DataFrame.from_records(
             [
                 {
-                    'sid': n,
+                    'sid': sid,
                     'symbol':  'TEST.A',
-                    'company_name': "company %d" % n,
+                    'company_name': "company %d" % sid,
                     'start_date': as_of.value,
                     'end_date': as_of.value,
-                    'exchange': 'EXCHANGE %d' % n,
+                    'exchange': 'EXCHANGE %d' % sid,
                 }
-                for n in range(num_assets)
+                for sid in sids
             ]
         )
 
@@ -1490,7 +1490,7 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
         })
         self.write_assets(equities=frame, exchanges=exchanges)
         finder = self.asset_finder
-        assets = [finder.retrieve_asset(n) for n in range(3)]
+        assets = finder.retrieve_all(sids)
 
         def shouldnt_resolve(ticker):
             with self.assertRaises(SymbolNotFound):
@@ -1510,9 +1510,9 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
             # '@' is not a supported delimiter
             shouldnt_resolve('TEST@A')
 
-            # Adding an unnecessary fuzzy shouldn't matter.
-            for fuzzy_char in '-', '/', '_', '.':
-                ticker = 'TEST%sA' % fuzzy_char
+            # Adding an unnecessary delimiter shouldn't matter.
+            for delimiter in '-', '/', '_', '.':
+                ticker = 'TEST%sA' % delimiter
                 with self.assertRaises(MultipleSymbolsFound):
                     finder.lookup_symbol(ticker, as_of)
 
@@ -1529,15 +1529,15 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
                     )
 
     def test_lookup_symbol_fuzzy(self):
-        num_exchanges = 3
+        num_countries = 3
         metadata = pd.DataFrame.from_records([
             {'symbol': symbol, 'exchange': 'EXCHANGE %d' % n}
-            for n in range(num_exchanges)
+            for n in range(num_countries)
             for symbol in ('PRTY_HRD', 'BRKA', 'BRK_A')
         ])
         exchanges = pd.DataFrame({
             'exchange': metadata['exchange'].unique(),
-            'country_code': list(map(self.country_code, range(num_exchanges))),
+            'country_code': list(map(self.country_code, range(num_countries))),
         })
         self.write_assets(equities=metadata, exchanges=exchanges)
         finder = self.asset_finder
@@ -1550,19 +1550,21 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
         with self.assertRaises(SymbolNotFound):
             finder.lookup_symbol('PRTYHRD', dt)
 
-        for n in range(num_exchanges):
+        for n in range(num_countries):
+            # Given that this ticker isn't defined in any country, explicitly
+            # passing a country code should still fail.
             with self.assertRaises(SymbolNotFound):
                 finder.lookup_symbol(
                     'PRTYHRD',
                     None,
                     country_code=self.country_code(n),
                 )
-                with self.assertRaises(SymbolNotFound):
-                    finder.lookup_symbol(
-                        'PRTYHRD',
-                        dt,
-                        country_code=self.country_code(n),
-                    )
+            with self.assertRaises(SymbolNotFound):
+                finder.lookup_symbol(
+                    'PRTYHRD',
+                    dt,
+                    country_code=self.country_code(n),
+                )
 
         with self.assertRaises(MultipleSymbolsFound):
             finder.lookup_symbol('PRTYHRD', None, fuzzy=True)
@@ -1570,7 +1572,7 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
         with self.assertRaises(MultipleSymbolsFound):
             finder.lookup_symbol('PRTYHRD', dt, fuzzy=True)
 
-        def check_sid(expected_sid, ticker, n):
+        def check_sid(expected_sid, ticker, country_code):
             params = (
                 {'as_of_date': None},
                 {'as_of_date': dt},
@@ -1585,19 +1587,19 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
                     expected_sid,
                     finder.lookup_symbol(
                         ticker,
-                        country_code=self.country_code(n),
+                        country_code=country_code,
                         **extra_params
                     ),
                 )
 
-        for n in range(num_exchanges):
-            check_sid(n * 3, 'PRTY_HRD', n)
-            check_sid(n * 3 + 1, 'BRKA', n)
-            check_sid(n * 3 + 2, 'BRK_A', n)
+        for n in range(num_countries):
+            check_sid(n * 3, 'PRTY_HRD', self.country_code(n))
+            check_sid(n * 3 + 1, 'BRKA', self.country_code(n))
+            check_sid(n * 3 + 2, 'BRK_A', self.country_code(n))
 
     def test_lookup_symbol_change_ticker(self):
         T = partial(pd.Timestamp, tz='utc')
-        num_exchanges = 3
+        num_countries = 3
         metadata = pd.DataFrame.from_records(
             [
                 # first sid per country
@@ -1627,21 +1629,60 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
                     'start_date': T('2014-01-06'),
                     'end_date': T('2014-01-10'),
                 },
-            ] * num_exchanges,
-            index=np.repeat(np.arange(num_exchanges * 2), 2),
+            ] * num_countries,
+            index=np.repeat(np.arange(num_countries * 2), 2),
         )
         metadata['exchange'] = np.repeat(
-            ['EXCHANGE %d' % n for n in range(num_exchanges)],
+            ['EXCHANGE %d' % n for n in range(num_countries)],
             4,
         )
         exchanges = pd.DataFrame({
-            'exchange': ['EXCHANGE %d' % n for n in range(num_exchanges)],
+            'exchange': ['EXCHANGE %d' % n for n in range(num_countries)],
             'country_code': [
-                self.country_code(n) for n in range(num_exchanges)
+                self.country_code(n) for n in range(num_countries)
             ]
         })
         self.write_assets(equities=metadata, exchanges=exchanges)
         finder = self.asset_finder
+
+        def assert_doesnt_resolve(symbol, as_of_date):
+            # check across all countries
+            with self.assertRaises(SymbolNotFound):
+                finder.lookup_symbol(symbol, as_of_date)
+
+            # check in each country individually
+            for n in range(num_countries):
+                with self.assertRaises(SymbolNotFound):
+                    finder.lookup_symbol(
+                        symbol,
+                        as_of_date,
+                        country_code=self.country_code(n),
+                    )
+
+        def assert_resolves_in_each_country(symbol,
+                                            as_of_date,
+                                            sid_from_country_ix,
+                                            expected_symbol,
+                                            expected_name):
+            # ensure this is ambiguous across all countries
+            with self.assertRaises(MultipleSymbolsFound):
+                finder.lookup_symbol(symbol, as_of_date)
+
+            for n in range(num_countries):
+                result = finder.lookup_symbol(
+                    symbol,
+                    as_of_date,
+                    country_code=self.country_code(n),
+                )
+                assert_equal(
+                    result,
+                    finder.retrieve_asset(sid_from_country_ix(n)),
+                    msg=str(asof),
+                )
+                # The symbol and asset_name should always be the last held
+                # values
+                assert_equal(result.symbol, expected_symbol)
+                assert_equal(result.asset_name, expected_name)
 
         # note: these assertions walk forward in time, starting at assertions
         # about ownership before the start_date and ending with assertions
@@ -1649,137 +1690,68 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
         # locations
 
         # no one held 'A' before 01
-        with self.assertRaises(SymbolNotFound):
-            finder.lookup_symbol('A', T('2013-12-31'))
-        for n in range(num_exchanges):
-            with self.assertRaises(SymbolNotFound):
-                finder.lookup_symbol(
-                    'A',
-                    T('2013-12-31'),
-                    country_code=self.country_code(n),
-                )
+        assert_doesnt_resolve('A', T('2013-12-31'))
 
         # no one held 'C' before 01
-        with self.assertRaises(SymbolNotFound):
-            finder.lookup_symbol('C', T('2013-12-31'))
-        for n in range(num_exchanges):
-            with self.assertRaises(SymbolNotFound):
-                finder.lookup_symbol(
-                    'C',
-                    T('2013-12-31'),
-                    country_code=self.country_code(n),
-                )
+        assert_doesnt_resolve('C', T('2013-12-31'))
 
         for asof in pd.date_range('2014-01-01', '2014-01-05', tz='utc'):
             # from 01 through 05 the first sid on the exchange held 'A'
-            with self.assertRaises(MultipleSymbolsFound):
-                finder.lookup_symbol('A', asof)
-
-            for n in range(num_exchanges):
-                A_result = finder.lookup_symbol(
-                    'A',
-                    asof,
-                    country_code=self.country_code(n),
-                )
-                assert_equal(
-                    A_result,
-                    finder.retrieve_asset(n * 2),
-                    msg=str(asof),
-                )
-                # The symbol and asset_name should always be the last held
-                # values
-                assert_equal(A_result.symbol, 'B')
-                assert_equal(A_result.asset_name, 'Asset B')
+            assert_resolves_in_each_country(
+                'A',
+                asof,
+                sid_from_country_ix=lambda n: n * 2,
+                expected_symbol='B',
+                expected_name='Asset B',
+            )
 
             # from 01 through 05 the second sid on the exchange held 'C'
-            with self.assertRaises(MultipleSymbolsFound):
-                finder.lookup_symbol('C', asof)
-
-            for n in range(num_exchanges):
-                C_result = finder.lookup_symbol(
-                    'C',
-                    asof,
-                    country_code=self.country_code(n),
-                )
-                assert_equal(
-                    C_result,
-                    finder.retrieve_asset(n * 2 + 1),
-                    msg=str(asof),
-                )
-                # The symbol and asset_name should always be the last held
-                # values
-                assert_equal(C_result.symbol, 'A')
-                assert_equal(C_result.asset_name, 'Asset A')
+            assert_resolves_in_each_country(
+                'C',
+                asof,
+                sid_from_country_ix=lambda n: n * 2 + 1,
+                expected_symbol='A',
+                expected_name='Asset A',
+            )
 
         # no one held 'B' before 06
-        with self.assertRaises(SymbolNotFound):
-            finder.lookup_symbol('B', T('2014-01-05'))
-        for n in range(num_exchanges):
-            with self.assertRaises(SymbolNotFound):
-                finder.lookup_symbol(
-                    'B',
-                    T('2014-01-05'),
-                    country_code=self.country_code(n),
-                )
+        assert_doesnt_resolve('B', T('2014-01-05'))
 
         # no one held 'C' after 06, however, no one has claimed it yet
         # so it still maps to sid 1
-        with self.assertRaises(MultipleSymbolsFound):
-            finder.lookup_symbol('C', T('2014-01-07'))
-
-        for n in range(num_exchanges):
-            assert_equal(
-                finder.lookup_symbol(
-                    'C',
-                    T('2014-01-07'),
-                    country_code=self.country_code(n),
-                ),
-                finder.retrieve_asset(n * 2 + 1),
-            )
+        assert_resolves_in_each_country(
+            'C',
+            T('2014-01-07'),
+            sid_from_country_ix=lambda n: n * 2 + 1,
+            expected_symbol='A',
+            expected_name='Asset A',
+        )
 
         for asof in pd.date_range('2014-01-06', '2014-01-11', tz='utc'):
             # from 06 through 10 sid 0 held 'B'
             # we test through the 11th because sid 1 is the last to hold 'B'
             # so it should ffill
-            with self.assertRaises(MultipleSymbolsFound):
-                finder.lookup_symbol('B', asof)
-
-            for n in range(num_exchanges):
-                B_result = finder.lookup_symbol(
-                    'B',
-                    asof,
-                    country_code=self.country_code(n),
-                )
-                assert_equal(
-                    B_result,
-                    finder.retrieve_asset(n * 2),
-                    msg=str(asof),
-                )
-                assert_equal(B_result.symbol, 'B')
-                assert_equal(B_result.asset_name, 'Asset B')
+            assert_resolves_in_each_country(
+                'B',
+                asof,
+                sid_from_country_ix=lambda n: n * 2,
+                expected_symbol='B',
+                expected_name='Asset B',
+            )
 
             # from 06 through 10 sid 1 held 'A'
             # we test through the 11th because sid 1 is the last to hold 'A'
             # so it should ffill
-            with self.assertRaises(MultipleSymbolsFound):
-                finder.lookup_symbol('A', asof)
-
-            for n in range(num_exchanges):
-                A_result = finder.lookup_symbol(
-                    'A',
-                    asof,
-                    country_code=self.country_code(n),
-                )
-                assert_equal(
-                    A_result,
-                    finder.retrieve_asset(n * 2 + 1),
-                    msg=str(asof),
-                )
-                assert_equal(A_result.symbol, 'A')
-                assert_equal(A_result.asset_name, 'Asset A')
+            assert_resolves_in_each_country(
+                'A',
+                asof,
+                sid_from_country_ix=lambda n: n * 2 + 1,
+                expected_symbol='A',
+                expected_name='Asset A',
+            )
 
     def test_lookup_symbol(self):
-        num_exchanges = 3
+        num_countries = 3
         # Incrementing by two so that start and end dates for each
         # generated Asset don't overlap (each Asset's end_date is the
         # day after its start date.)
@@ -1793,14 +1765,14 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
                     'end_date': (date + timedelta(days=1)).value,
                     'exchange': 'EXCHANGE %d' % n,
                 }
-                for n in range(num_exchanges)
+                for n in range(num_countries)
                 for i, date in enumerate(dates)
             ]
         )
         exchanges = pd.DataFrame({
-            'exchange': ['EXCHANGE %d' % n for n in range(num_exchanges)],
+            'exchange': ['EXCHANGE %d' % n for n in range(num_countries)],
             'country_code': [
-                self.country_code(n) for n in range(num_exchanges)
+                self.country_code(n) for n in range(num_countries)
             ],
         })
         self.write_assets(equities=df, exchanges=exchanges)
@@ -1808,7 +1780,7 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
         for _ in range(2):  # Run checks twice to test for caching bugs.
             with self.assertRaises(SymbolNotFound):
                 finder.lookup_symbol('NON_EXISTING', dates[0])
-            for n in range(num_exchanges):
+            for n in range(num_countries):
                 with self.assertRaises(SymbolNotFound):
                     finder.lookup_symbol(
                         'NON_EXISTING',
@@ -1819,7 +1791,7 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
             with self.assertRaises(MultipleSymbolsFound):
                 finder.lookup_symbol('EXISTING', None)
 
-            for n in range(num_exchanges):
+            for n in range(num_countries):
                 with self.assertRaises(MultipleSymbolsFound):
                     finder.lookup_symbol(
                         'EXISTING',
@@ -1833,7 +1805,7 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
                 with self.assertRaises(MultipleSymbolsFound):
                     finder.lookup_symbol('EXISTING', date)
 
-                for n in range(num_exchanges):
+                for n in range(num_countries):
                     result = finder.lookup_symbol(
                         'EXISTING',
                         date,
@@ -1844,7 +1816,7 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
                     self.assertEqual(result.sid, expected_sid)
 
     def test_fail_to_write_overlapping_data(self):
-        num_exchanges = 3
+        num_countries = 3
         df = pd.DataFrame.from_records(concat(
             [
                 {
@@ -1871,12 +1843,12 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
                     'exchange': 'EXCHANGE %d' % n,
                 },
             ]
-            for n in range(num_exchanges)
+            for n in range(num_countries)
         ))
         exchanges = pd.DataFrame({
-            'exchange': ['EXCHANGE %d' % n for n in range(num_exchanges)],
+            'exchange': ['EXCHANGE %d' % n for n in range(num_countries)],
             'country_code': [
-                self.country_code(n) for n in range(num_exchanges)
+                self.country_code(n) for n in range(num_countries)
             ],
         })
 
@@ -1928,7 +1900,7 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
         """
 
         date = pd.Timestamp('2013-01-01', tz='UTC')
-        num_exchanges = 3
+        num_countries = 3
         df = pd.DataFrame.from_records(concat(
             [
                 {
@@ -1954,12 +1926,12 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
                 },
 
             ]
-            for n in range(num_exchanges)
+            for n in range(num_countries)
         ))
         exchanges = pd.DataFrame({
-            'exchange': ['EXCHANGE %d' % n for n in range(num_exchanges)],
+            'exchange': ['EXCHANGE %d' % n for n in range(num_countries)],
             'country_code': [
-                self.country_code(n) for n in range(num_exchanges)
+                self.country_code(n) for n in range(num_countries)
             ],
         })
         self.write_assets(equities=df, exchanges=exchanges)
@@ -1972,7 +1944,7 @@ class AssetFinderMultipleCountries(WithTradingCalendars, ZiplineTestCase):
                 fuzzy=True,
             )
 
-        for n in range(num_exchanges):
+        for n in range(num_countries):
             result = finder.lookup_symbol(
                 'FOO/B',
                 date + timedelta(days=90),
